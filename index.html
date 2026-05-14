@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>ASR System Prototype</title>
+    <style>
+        body { font-family: sans-serif; margin: 40px; background: #f4f4f9; }
+        .door { background: white; padding: 20px; margin-bottom: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        button { padding: 10px 15px; cursor: pointer; background: #0056b3; color: white; border: none; border-radius: 4px; }
+        button:hover { background: #004494; }
+    </style>
+</head>
+<body>
+
+    <h1>ASR System Prototype</h1>
+
+    <div class="door">
+        <h2>Door 1: Streaming ASR (WebSocket)</h2>
+        <p>Send 5 rapid chunks (1000 bytes each) to fill the 5000-byte server buffer.</p>
+        <button onclick="startStreaming()">Stream 5000 Bytes</button>
+        <ul id='messages' style="color: green;"></ul>
+    </div>
+
+    <div class="door">
+        <h2>Door 2: Batch ASR (File Upload)</h2>
+        <p>Upload a file to test validation (WAV, MP3, OGG, FLAC, MP4).</p>
+        
+        <input type="file" id="audioFile" accept=".wav,.mp3,.ogg,.flac,.mp4">
+        <button onclick="uploadFile()">Upload & Validate</button>
+        
+        <p id="uploadResult" style="font-weight: bold;"></p>
+    </div>
+
+    <script>
+        // --- STREAMING LOGIC ---
+        var ws = new WebSocket("ws://localhost:8000/ws");
+        
+        ws.onmessage = function(event) {
+            var messages = document.getElementById('messages');
+            var li = document.createElement('li');
+            li.appendChild(document.createTextNode(event.data));
+            messages.appendChild(li);
+        };
+        
+        function startStreaming() {
+            // Instantly send 5 chunks to trigger the server's AI buffer
+            for (let i = 0; i < 5; i++) {
+                ws.send(new Uint8Array(1000));
+            }
+        }
+
+        // --- BATCH LOGIC ---
+        async function uploadFile() {
+            var fileInput = document.getElementById('audioFile');
+            var file = fileInput.files[0];
+            var resultText = document.getElementById('uploadResult');
+            
+            if (!file) {
+                alert("Please select a file first.");
+                return;
+            }
+
+            resultText.innerText = "Uploading to server...";
+            resultText.style.color = "black";
+
+            var formData = new FormData();
+            formData.append("file", file);
+
+            // 1. Send the file
+            var response = await fetch("/api/v1/asr/batch", {
+                method: "POST",
+                body: formData
+            });
+
+            var result = await response.json();
+
+            if (!response.ok) {
+                resultText.innerText = "ERROR: " + result.detail;
+                resultText.style.color = "red";
+                return;
+            } 
+            
+            // 2. We got the receipt! Start checking the status.
+            var jobId = result.job_id;
+            resultText.innerText = "Queued! Job ID: " + jobId + ". Waiting for AI...";
+            resultText.style.color = "orange";
+            
+            checkStatus(jobId, resultText);
+        }
+
+        async function checkStatus(jobId, uiElement) {
+            var response = await fetch("/api/v1/asr/jobs/" + jobId);
+            var jobData = await response.json();
+
+            if (jobData.status === "processing") {
+                uiElement.innerText = "AI is processing your file... please wait.";
+                uiElement.style.color = "blue";
+                setTimeout(() => checkStatus(jobId, uiElement), 1000);
+            } 
+            else if (jobData.status === "completed") {
+                uiElement.innerText = "DONE! Transcript: " + jobData.transcript;
+                uiElement.style.color = "green";
+            }
+            // NEW: Catch the failed status
+            else if (jobData.status === "failed") {
+                uiElement.innerText = "AI FAILED: " + jobData.transcript;
+                uiElement.style.color = "red";
+            }
+            else {
+                setTimeout(() => checkStatus(jobId, uiElement), 1000);
+            }
+        }
+    </script>
+</body>
+</html>
