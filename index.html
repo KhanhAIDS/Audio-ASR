@@ -14,10 +14,10 @@
     <h1>ASR System Prototype</h1>
 
     <div class="door">
-        <h2>Door 1: Streaming ASR (WebSocket)</h2>
-        <p>Send 5 rapid chunks (1000 bytes each) to fill the 5000-byte server buffer.</p>
-        <button onclick="startStreaming()">Stream 5000 Bytes</button>
-        <ul id='messages' style="color: green;"></ul>
+        <h2>Door 1: Live Streaming ASR (Microphone)</h2>
+        <p>Click below to open your microphone. The system will process your speech in 3-second real-time chunks.</p>
+        <button onclick="startStreaming()">Start Listening</button>
+        <ul id='messages' style="color: green; list-style-type: none; padding-left: 0;"></ul>
     </div>
 
     <div class="door">
@@ -33,19 +33,48 @@
     <script>
         // --- STREAMING LOGIC ---
         var ws = new WebSocket("ws://localhost:8000/ws");
+        var mediaRecorder;
         
         ws.onmessage = function(event) {
-            var messages = document.getElementById('messages');
-            var li = document.createElement('li');
-            li.appendChild(document.createTextNode(event.data));
-            messages.appendChild(li);
+            // Parse the new SRS-compliant JSON response
+            var data = JSON.parse(event.data);
+            
+            if (data.type === "segment") {
+                var messages = document.getElementById('messages');
+                var li = document.createElement('li');
+                // Display the detected language and the text
+                li.appendChild(document.createTextNode("[" + data.language + "] " + data.text));
+                messages.appendChild(li);
+            } else if (data.type === "error") {
+                console.error("Server Error:", data.message);
+            }
         };
         
-        function startStreaming() {
-            // Instantly send 5 chunks to trigger the server's AI buffer
-            for (let i = 0; i < 5; i++) {
-                ws.send(new Uint8Array(1000));
-            }
+        async function startStreaming() {
+            var btn = document.querySelector("button[onclick='startStreaming()']");
+            btn.innerText = "Listening... (Speak now)";
+            btn.style.backgroundColor = "red";
+
+            var stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            mediaRecorder = new MediaRecorder(stream);
+            
+            mediaRecorder.ondataavailable = async function(event) {
+                if (event.data.size > 0 && ws.readyState === WebSocket.OPEN) {
+                    var arrayBuffer = await event.data.arrayBuffer();
+                    ws.send(arrayBuffer);
+                }
+            };
+            
+            // Start recording immediately
+            mediaRecorder.start(); 
+            
+            // THE FIX: Stop and restart every 3 seconds to guarantee a valid file header
+            setInterval(() => {
+                if(mediaRecorder.state === "recording") {
+                    mediaRecorder.stop(); 
+                    mediaRecorder.start();
+                }
+            }, 3000);
         }
 
         // --- BATCH LOGIC ---
@@ -97,10 +126,17 @@
                 setTimeout(() => checkStatus(jobId, uiElement), 1000);
             } 
             else if (jobData.status === "completed") {
-                uiElement.innerText = "DONE! Transcript: " + jobData.transcript;
+                let displayText = "DONE! \n\nFull Text: " + jobData.transcript + "\n\nTimestamps & Speakers:\n";
+                
+                // Now displays the real Pyannote speaker label (e.g., SPEAKER_00, SPEAKER_01)
+                jobData.segments.forEach(seg => {
+                    displayText += `[${seg.start_ms}ms - ${seg.end_ms}ms] ${seg.speaker}: ${seg.text}\n`;
+                });
+                
+                uiElement.innerText = displayText;
                 uiElement.style.color = "green";
+                uiElement.style.whiteSpace = "pre-wrap"; 
             }
-            // NEW: Catch the failed status
             else if (jobData.status === "failed") {
                 uiElement.innerText = "AI FAILED: " + jobData.transcript;
                 uiElement.style.color = "red";
