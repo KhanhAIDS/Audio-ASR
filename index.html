@@ -5,8 +5,21 @@
     <style>
         body { font-family: sans-serif; margin: 40px; background: #f4f4f9; }
         .door { background: white; padding: 20px; margin-bottom: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
-        button { padding: 10px 15px; cursor: pointer; background: #0056b3; color: white; border: none; border-radius: 4px; }
+        button { padding: 10px 15px; margin-right: 5px; cursor: pointer; background: #0056b3; color: white; border: none; border-radius: 4px; font-weight: bold; }
         button:hover { background: #004494; }
+        button:disabled { background: #cccccc; color: #666; cursor: not-allowed; }
+        .btn-danger { background: #dc3545; }
+        .btn-danger:hover { background: #c82333; }
+        .btn-warning { background: #ffc107; color: black; }
+        .btn-warning:hover { background: #e0a800; }
+        .btn-secondary { background: #6c757d; }
+        .btn-secondary:hover { background: #5a6268; }
+        
+        #visualizer { width: 100%; height: 100px; background: #fff; border-radius: 4px; border: 1px solid #ddd; margin-top: 15px; display: block; }
+        
+        /* NEW: Blinking red dot for recording timer */
+        .recording-dot { color: red; animation: blink 1s linear infinite; }
+        @keyframes blink { 50% { opacity: 0; } }
     </style>
 </head>
 <body>
@@ -15,9 +28,24 @@
 
     <div class="door">
         <h2>Door 1: Live Streaming ASR (Microphone)</h2>
-        <p>Click below to open your microphone. The system will process your speech in 3-second real-time chunks.</p>
-        <button onclick="startStreaming()">Start Listening</button>
-        <ul id='messages' style="color: green; list-style-type: none; padding-left: 0;"></ul>
+        <p>Click below to control your microphone. The system will process your speech in 3-second real-time chunks.</p>
+        
+        <div>
+            <button id="startBtn" onclick="startStreaming()">Start Listening</button>
+            <button id="pauseBtn" class="btn-warning" onclick="pauseStreaming()" disabled>Pause</button>
+            <button id="resumeBtn" class="btn-warning" onclick="resumeStreaming()" disabled style="display:none;">Resume</button>
+            <button id="stopBtn" class="btn-danger" onclick="stopStreaming()" disabled>Stop</button>
+            
+            <button id="clearBtn" class="btn-secondary" onclick="clearTranscript()">Clear Transcript</button>
+            
+            <span id="recordingTimer" style="font-size: 1.2em; font-weight: bold; margin-left: 15px; display: none;">
+                <span class="recording-dot">●</span> <span id="timerDisplay">00:00</span>
+            </span>
+        </div>
+
+        <canvas id="visualizer"></canvas>
+
+        <ul id='messages' style="color: green; list-style-type: none; padding-left: 0; margin-top: 15px; font-family: monospace; font-size: 1.1em;"></ul>
     </div>
 
     <div class="door">
@@ -31,50 +59,226 @@
     </div>
 
     <script>
-        // --- STREAMING LOGIC ---
-        var ws = new WebSocket("ws://localhost:8000/ws");
+        var ws;
         var mediaRecorder;
+        var streamInterval;
+        var isPaused = false;
         
-        ws.onmessage = function(event) {
-            // Parse the new SRS-compliant JSON response
-            var data = JSON.parse(event.data);
-            
-            if (data.type === "segment") {
-                var messages = document.getElementById('messages');
-                var li = document.createElement('li');
-                // Display the detected language and the text
-                li.appendChild(document.createTextNode("[" + data.language + "] " + data.text));
-                messages.appendChild(li);
-            } else if (data.type === "error") {
-                console.error("Server Error:", data.message);
-            }
-        };
-        
-        async function startStreaming() {
-            var btn = document.querySelector("button[onclick='startStreaming()']");
-            btn.innerText = "Listening... (Speak now)";
-            btn.style.backgroundColor = "red";
+        var audioContext;
+        var analyser;
+        var dataArray;
+        var canvasCtx;
+        var animationId;
 
+        // --- NEW: UI Timer Variables ---
+        var recordingSeconds = 0;
+        var uiTimerInterval = null;
+
+        function formatTime(totalSeconds) {
+            var m = Math.floor(totalSeconds / 60).toString().padStart(2, '0');
+            var s = (totalSeconds % 60).toString().padStart(2, '0');
+            return m + ":" + s;
+        }
+
+        function startUiTimer() {
+            document.getElementById('recordingTimer').style.display = 'inline-block';
+            if (uiTimerInterval) clearInterval(uiTimerInterval);
+            uiTimerInterval = setInterval(() => {
+                recordingSeconds++;
+                document.getElementById('timerDisplay').innerText = formatTime(recordingSeconds);
+            }, 1000);
+        }
+
+        function pauseUiTimer() {
+            if (uiTimerInterval) clearInterval(uiTimerInterval);
+            document.querySelector('.recording-dot').style.animation = 'none'; // Stop blinking
+            document.querySelector('.recording-dot').style.opacity = '0.5';
+        }
+
+        function resumeUiTimer() {
+            document.querySelector('.recording-dot').style.animation = 'blink 1s linear infinite'; // Resume blinking
+            startUiTimer();
+        }
+
+        function stopUiTimer() {
+            if (uiTimerInterval) clearInterval(uiTimerInterval);
+            document.getElementById('recordingTimer').style.display = 'none';
+            recordingSeconds = 0;
+            document.getElementById('timerDisplay').innerText = "00:00";
+        }
+
+        // --- NEW: Clear Transcript Function ---
+        function clearTranscript() {
+            document.getElementById('messages').innerHTML = '';
+        }
+
+        function connectWebSocket() {
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                var ws_url = "ws://" + window.location.host + "/ws"; 
+                ws = new WebSocket(ws_url); 
+                
+                ws.onmessage = function(event) {
+                    var data = JSON.parse(event.data);
+                    if (data.type === "segment") {
+                        var messages = document.getElementById('messages');
+                        var li = document.createElement('li');
+                        
+                        // NEW: Add the formatted timestamps to the output!
+                        var timestampStr = `[${formatTime(data.start_time)} - ${formatTime(data.end_time)}]`;
+                        li.appendChild(document.createTextNode(`${timestampStr} [${data.language}] ${data.text}`));
+                        
+                        messages.appendChild(li);
+                    } else if (data.type === "error") {
+                        console.error("Server Error:", data.message);
+                    }
+                };
+            }
+        }
+
+        async function initAudio() {
             var stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-            mediaRecorder = new MediaRecorder(stream);
             
+            audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            var source = audioContext.createMediaStreamSource(stream);
+            analyser = audioContext.createAnalyser();
+            analyser.fftSize = 2048; 
+            source.connect(analyser);
+            
+            var bufferLength = analyser.frequencyBinCount;
+            dataArray = new Uint8Array(bufferLength);
+            
+            var canvas = document.getElementById("visualizer");
+            canvasCtx = canvas.getContext("2d");
+            
+            canvas.width = canvas.offsetWidth;
+            canvas.height = canvas.offsetHeight;
+            
+            drawWaveform();
+
+            mediaRecorder = new MediaRecorder(stream);
             mediaRecorder.ondataavailable = async function(event) {
-                if (event.data.size > 0 && ws.readyState === WebSocket.OPEN) {
+                if (event.data.size > 0 && ws && ws.readyState === WebSocket.OPEN && !isPaused) {
                     var arrayBuffer = await event.data.arrayBuffer();
                     ws.send(arrayBuffer);
                 }
             };
+        }
+
+        function drawWaveform() {
+            animationId = requestAnimationFrame(drawWaveform);
             
-            // Start recording immediately
-            mediaRecorder.start(); 
+            if (!isPaused) {
+                analyser.getByteTimeDomainData(dataArray);
+            }
+
+            var canvas = document.getElementById("visualizer");
+            canvasCtx.fillStyle = '#fff';
+            canvasCtx.fillRect(0, 0, canvas.width, canvas.height);
+
+            canvasCtx.lineWidth = 2;
+            canvasCtx.strokeStyle = isPaused ? '#cccccc' : '#0056b3'; 
+            canvasCtx.beginPath();
+
+            var sliceWidth = canvas.width * 1.0 / analyser.frequencyBinCount;
+            var x = 0;
+
+            for (var i = 0; i < analyser.frequencyBinCount; i++) {
+                var v = dataArray[i] / 128.0;
+                var y = v * canvas.height / 2;
+
+                if (i === 0) {
+                    canvasCtx.moveTo(x, y);
+                } else {
+                    canvasCtx.lineTo(x, y);
+                }
+                x += sliceWidth;
+            }
             
-            // THE FIX: Stop and restart every 3 seconds to guarantee a valid file header
-            setInterval(() => {
-                if(mediaRecorder.state === "recording") {
+            canvasCtx.lineTo(canvas.width, canvas.height / 2);
+            canvasCtx.stroke();
+        }
+
+        async function startStreaming() {
+            document.getElementById('startBtn').disabled = true;
+            document.getElementById('pauseBtn').disabled = false;
+            document.getElementById('stopBtn').disabled = false;
+            
+            connectWebSocket();
+            
+            if (!mediaRecorder) {
+                await initAudio();
+            }
+            
+            isPaused = false;
+            if (mediaRecorder.state === "inactive") mediaRecorder.start();
+            
+            recordingSeconds = 0;
+            document.getElementById('timerDisplay').innerText = "00:00";
+            document.querySelector('.recording-dot').style.animation = 'blink 1s linear infinite';
+            document.querySelector('.recording-dot').style.opacity = '1';
+            startUiTimer();
+            startInterval();
+        }
+        
+        function startInterval() {
+            if (streamInterval) clearInterval(streamInterval);
+            streamInterval = setInterval(() => {
+                if (mediaRecorder.state === "recording" && !isPaused) {
                     mediaRecorder.stop(); 
                     mediaRecorder.start();
                 }
             }, 3000);
+        }
+
+        function pauseStreaming() {
+            isPaused = true; 
+            
+            document.getElementById('pauseBtn').style.display = 'none';
+            document.getElementById('resumeBtn').style.display = 'inline-block';
+            document.getElementById('resumeBtn').disabled = false;
+            pauseUiTimer();
+        }
+        
+        function resumeStreaming() {
+            isPaused = false; 
+            
+            document.getElementById('resumeBtn').style.display = 'none';
+            document.getElementById('pauseBtn').style.display = 'inline-block';
+            
+            if(mediaRecorder.state === "recording") {
+                mediaRecorder.stop();
+                mediaRecorder.start();
+            }
+            
+            resumeUiTimer();
+            startInterval();
+        }
+
+        function stopStreaming() {
+            isPaused = true;
+            if (streamInterval) clearInterval(streamInterval);
+            
+            if (mediaRecorder && mediaRecorder.state !== "inactive") {
+                mediaRecorder.stop();
+                mediaRecorder.stream.getTracks().forEach(track => track.stop());
+                mediaRecorder = null; 
+            }
+            
+            if (animationId) cancelAnimationFrame(animationId);
+            canvasCtx.clearRect(0, 0, document.getElementById("visualizer").width, document.getElementById("visualizer").height);
+
+            document.getElementById('startBtn').disabled = false;
+            document.getElementById('pauseBtn').disabled = true;
+            document.getElementById('resumeBtn').disabled = true;
+            document.getElementById('stopBtn').disabled = true;
+            document.getElementById('pauseBtn').style.display = 'inline-block';
+            document.getElementById('resumeBtn').style.display = 'none';
+            stopUiTimer();
+            
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.close();
+                ws = null;
+            }
         }
 
         // --- BATCH LOGIC ---
@@ -94,7 +298,6 @@
             var formData = new FormData();
             formData.append("file", file);
 
-            // 1. Send the file
             var response = await fetch("/api/v1/asr/batch", {
                 method: "POST",
                 body: formData
@@ -108,7 +311,6 @@
                 return;
             } 
             
-            // 2. We got the receipt! Start checking the status.
             var jobId = result.job_id;
             resultText.innerText = "Queued! Job ID: " + jobId + ". Waiting for AI...";
             resultText.style.color = "orange";
@@ -127,12 +329,9 @@
             } 
             else if (jobData.status === "completed") {
                 let displayText = "DONE! \n\nFull Text: " + jobData.transcript + "\n\nTimestamps & Speakers:\n";
-                
-                // Now displays the real Pyannote speaker label (e.g., SPEAKER_00, SPEAKER_01)
                 jobData.segments.forEach(seg => {
                     displayText += `[${seg.start_ms}ms - ${seg.end_ms}ms] ${seg.speaker}: ${seg.text}\n`;
                 });
-                
                 uiElement.innerText = displayText;
                 uiElement.style.color = "green";
                 uiElement.style.whiteSpace = "pre-wrap"; 
